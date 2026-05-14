@@ -4,16 +4,13 @@ import os
 import math
 import numpy as np
 from threading import Thread, Lock
-from enum import Enum, auto
-from std_msgs.msg import Int32
 
-# ROS 2 Imports
 import rclpy
 
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image, Imu, LaserScan,CameraInfo
+from sensor_msgs.msg import Image, Imu, CameraInfo
 from cv_bridge import CvBridge
 
 # OpenCV
@@ -179,21 +176,6 @@ def get_pitch_from_quaternion(x, y, z, w):
     return pitch
 
 
-def foward_113(msg, Ctrl,T):
-        msg.mode = 11
-        msg.gait_id = 3
-        msg.vel_des = [0.3, 0.0, 0.0]
-        msg.rpy_des = [0.0, -0.15, 0.0]
-        msg.step_height = [0.06, 0.06]
-        msg.pos_des = [0, 0, 0.28]
-        msg.duration = 0
-        msg.life_count = (msg.life_count + 1) % 128
-            
-        Ctrl.Send_cmd(msg)
-
-        time.sleep(T)
-
-
 class ImuTestNode(Node):
     def __init__(self):
         super().__init__('qx_detector_node')
@@ -255,16 +237,6 @@ class VisionUtils:
             self.logger.error(f"CvBridge error: {e}")
             return None
 
-    def show(self, window_name, img):
-        if self.has_display and img is not None:
-            cv.imshow(window_name, img)
-            cv.waitKey(1)
-
-    @staticmethod
-    def destroy_all():
-        if os.environ.get('DISPLAY') is not None:
-            cv.destroyAllWindows()
-
 
 class DynamicVisionNode(Node):
     def __init__(self, node_name, topic_name, callback_func):
@@ -295,14 +267,6 @@ class DynamicVisionNode(Node):
             )
             self.is_active = True
             self.get_logger().info(f">>> [{self.get_name()}] 已激活，开始接收图像")
-
-    def disable(self):
-        """停止订阅，释放资源"""
-        if self.is_active and self.subscription is not None:
-            self.destroy_subscription(self.subscription)
-            self.subscription = None
-            self.is_active = False
-            self.get_logger().info(f"<<< [{self.get_name()}] 已停用，停止接收图像")
 
     def _internal_callback(self, msg):
         """内部回调：先检查业务逻辑是否需要处理，再调用具体算法"""
@@ -899,251 +863,6 @@ class LaneFollowerPP(Node):
         mask_vis = cv.cvtColor(mask, cv.COLOR_GRAY2BGR)
         return steer_h,steering, vis, mask_vis
 
-class LineDetectorNode(Node):
-    def __init__(self):
-        super().__init__('line_detector_node')
-        qos_profile = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST
-        )
-        self.declare_parameter('hue_low', 20)
-        self.declare_parameter('hue_high', 30)
-        self.declare_parameter('sat_low', 100)
-        self.declare_parameter('val_low', 100)
-        self.declare_parameter('turn_threshold', 20)
-        self.declare_parameter('roi_height_ratio', 0.4)
-        self.declare_parameter('roi_width_ratio', 0.6)
-        self.declare_parameter('default_forward', True)
-        self.declare_parameter('debug_mode', False)
-        self.declare_parameter('show_window', True)
-
-        self.cmd_w = None
-
-        self.img_sub = self.create_subscription(
-            Image, '/down_camera/image_raw', 
-            self.image_callback, qos_profile)
-        self.cam_info_sub = self.create_subscription(
-            CameraInfo, '/down_camera/camera_info', 
-            self.camera_info_callback, qos_profile)
-        
-        self.bridge = CvBridge()
-        self.camera_info = None
-
-        self.frame_count = 0
-        self.cmd_vel = 0
-        self.last_cmd = -1  # 上次发送的指令
-
-
-        self.fx = 177.69738981169561
-        self.fy = 177.69738981169561
-        self.cx = 160.5
-        self.cy = 90.5
-        self.img_width = 320
-        self.img_height = 180
-        
-        # --- 2. 机器人物理参数 (来自 URDF) ---
-        self.cam_height = 0.29      # 相机离地高度 (米)
-        self.cam_pitch = np.radians(30) # 相机俯仰角 (30度)
-        
-        # --- 3. 可调节的鸟瞰图窗口参数 (米) ---
-        # 你想看前方多远到多远的区域？修改这里即可调整“特定窗口”
-        self.view_distance_near = 0   # 最近距离 (避开底盘)
-        self.view_distance_far = 1.5    # 最远距离 (聚焦赛道)
-        self.view_width_total = 1     # 覆盖的总宽度 (米)
-        
-        # 输出鸟瞰图的分辨率 (像素)
-        self.bev_width = 300
-        self.bev_height = 400
-        
-        self.yellow_lower = np.array([15, 40, 30]) 
-        self.yellow_upper = np.array([45, 255, 255])
-        
-        # --- ROI 配置 ---
-        self.roi_y_start = 140
-        self.roi_y_end = 180
-        self.min_line_area = 50  # 稍微调大，过滤噪点
-        
-        # --- 形态学核 ---
-        self.kernel_close = np.ones((5, 5), np.uint8) # 用于连接断裂的黄线
-        self.kernel_open = np.ones((3, 3), np.uint8)
-        
-        # --- 滤波配置 ---
-        self.alpha_slope = 0.2
-        self.alpha_error = 0.2
-        self.deadzone_slope = 0.1
-        self.deadzone_error = 5.0
-        self.weight_power = 2.0
-        
-        # --- 状态缓存 ---
-        self.last_smooth_slope = 0.0
-        self.last_smooth_error = 0.0
-        self.frame_count = 0
-
-        # 状态缓存 (初始化为0或None)
-        self.last_smooth_slope = 0.0
-        self.last_smooth_error = 0.0
-        self.frame_count = 0
-        self.slope = 0
-        self.error = 0
-
-    
-    def camera_info_callback(self, msg):
-        self.camera_info = msg
-
-
-    def image_callback(self, msg):
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            self.frame_count += 1
-        except Exception as e:
-            self.get_logger().error(f'cv_bridge error: {e}')
-            return
-        
-        full_debug, control_data = self.process_image(cv_image)
-        self.slope = control_data['slope']
-        self.error = control_data['lateral_error']
-
-
-    def process_image(self, bgr_image):
-        height, width = bgr_image.shape[:2]
-        center_x = width // 2 - 50
-
-
-    def update_transform_matrix(self):
-        """根据物理参数重新计算透视变换矩阵"""
-        src_pts = []
-        
-        # 定义四个角的物理坐标 (相对于相机正下方的地面点)
-        # 顺序：左上(远左), 右上(远右), 右下(近右), 左下(近左)
-        # 注意：在图像中，"远"对应较小的 Y (顶部)，"近"对应较大的 Y (底部)
-        phys_corners = [
-            (-self.view_width_total / 2, self.view_distance_far), # 左上
-            (self.view_width_total / 2, self.view_distance_far),  # 右上
-            (self.view_width_total / 2, self.view_distance_near), # 右下
-            (-self.view_width_total / 2, self.view_distance_near) # 左下
-        ]
-        
-        for w_offset, distance in phys_corners:
-            x_img, y_img = self.world_to_pixel(distance, w_offset)
-            src_pts.append([x_img, y_img])
-            
-        self.src_pts = np.float32(src_pts)
-        
-        # 目标点：矩形鸟瞰图
-        self.dst_pts = np.float32([
-            [0, 0],
-            [self.bev_width, 0],
-            [self.bev_width, self.bev_height],
-            [0, self.bev_height]
-        ])
-        
-        # 计算矩阵
-        self.matrix = cv.getPerspectiveTransform(self.src_pts, self.dst_pts)
-        
-        # 打印调试信息
-        print(f"[BEV] 变换矩阵已更新:")
-        print(f"  物理范围: [{self.view_distance_near}m - {self.view_distance_far}m], 宽 {self.view_width_total}m")
-        print(f"  图像源点: {self.src_pts}")
-
-    def world_to_pixel(self, distance, width_offset):
-        """
-        将地面物理坐标 (距离，横向偏移) 映射到图像像素坐标
-        基于针孔相机模型和倾斜角度几何推导
-        """
-        # 1. 计算视线与水平面的夹角 (gamma)
-        # tan(gamma) = height / distance
-        gamma = np.arctan2(self.cam_height, distance)
-        
-        # 2. 计算视线与相机光轴的夹角 (alpha)
-        # alpha = gamma - pitch (因为 pitch 是向下倾斜的)
-        alpha = gamma - self.cam_pitch
-        
-        # 3. 计算 Y 像素坐标
-        # y = cy + fy * tan(alpha)
-        y_pix = self.cy + self.fy * np.tan(alpha)
-        
-        # 4. 计算 X 像素坐标
-        # 首先计算该点的斜距 (Slant Range) R = height / sin(gamma)
-        R = self.cam_height / np.sin(gamma)
-        
-        # 计算该距离处的水平视场角比例
-        # 地面宽度 w 对应的相机坐标系下的角度 beta ≈ atan(w / R)
-        # 更精确的：x = cx + fx * (X_cam / Z_cam)
-        # 在倾斜平面投影中，X_cam = width_offset, Z_cam = R * cos(alpha) ? 
-        # 简化工程公式：利用相似三角形，在该深度 R 处，像素密度
-        fov_h_half = np.arctan2(self.img_width / 2, self.fx)
-        ground_width_at_R = 2 * R * np.tan(fov_h_half)
-        
-        # 防止除以零
-        if ground_width_at_R <= 0: ground_width_at_R = 0.001
-        
-        pixels_per_meter = self.img_width / ground_width_at_R
-        x_pix = self.cx + width_offset * pixels_per_meter
-        
-        return x_pix, y_pix
-
-    def process_image(self, bgr_image):
-        """
-        主处理函数：集成你的逻辑 + BEV 变换 + 调试窗口
-        """
-        if bgr_image is None or bgr_image.size == 0:
-            return None
-
-        height, width = bgr_image.shape[:2]
-        
-        # 你的原始逻辑 (示例：计算中心偏移)
-        center_x = width // 2 - 50
-        
-        # 确保尺寸匹配内参 (如果不匹配则缩放)
-        if height != self.img_height or width != self.img_width:
-            bgr_image = cv.resize(bgr_image, (self.img_width, self.img_height))
-            height, width = bgr_image.shape[:2]
-
-        # --- 生成调试图层 (可视化源点梯形) ---
-        debug_img = bgr_image.copy()
-        # 绘制源点四边形
-        pts_int = self.src_pts.astype(int)
-        cv.polylines(debug_img, [pts_int], True, (0, 255, 0), 2) # 绿色框
-        
-        # 绘制关键点文字
-        for i, pt in enumerate(pts_int):
-            label = ["Far-L", "Far-R", "Near-R", "Near-L"][i]
-            cv.circle(debug_img, tuple(pt), 5, (0, 0, 255), -1)
-            cv.putText(debug_img, label, (pt[0]+5, pt[1]-5), 
-                        cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        # 绘制用户设定的中心线参考 (你的 center_x 逻辑)
-        cv.line(debug_img, (center_x, 0), (center_x, height), (255, 0, 0), 1)
-        cv.putText(debug_img, f"Center_X: {center_x}", (center_x + 10, 30), 
-                    cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 1)
-
-        # --- 执行透视变换 (生成鸟瞰图) ---
-        bev_image = cv.warpPerspective(
-            bgr_image, 
-            self.matrix, 
-            (self.bev_width, self.bev_height),
-            flags=cv.INTER_LINEAR,
-            borderMode=cv.BORDER_CONSTANT,
-            borderValue=(0, 0, 0) # 黑色填充区域
-        )
-        
-        # --- 显示调试窗口 ---
-        cv.imshow("1. Original + ROI Debug", debug_img)
-        cv.imshow("2. Bird's Eye View (BEV)", bev_image)
-        
-        # 按键处理 (按 'q' 退出，按 'u' 更新参数演示)
-        key = cv.waitKey(1) & 0xFF
-        if key == ord('q'):
-            return None # 信号退出
-        elif key == ord('u'):
-            # 演示动态调整：稍微增加观察距离
-            self.view_distance_far += 0.1
-            self.update_transform_matrix()
-            print("[Debug] 参数已更新，下一帧将生效")
-
-        return bev_image
 
 def main(args=None):
     rclpy.init(args=args)
@@ -1162,59 +881,10 @@ def main(args=None):
     executor.add_node(nodeLine)
 
 
-    PHASE_ALIGN = 1      # 阶段 1: 对准 (调整w到0.7085)
-    PHASE_FINE_TUNE = 2  # 阶段 2: 精调/结合 nodeS (杆子居中)
-    
-    PHASE_QR = 0
-    XIEHUO = 90
-    PHASE_TURN_RIGHT_1 = 3   # 第一次右转90度
-    PHASE_FORWARD_1 = 4      # 第一次直走一小段
-    PHASE_TURN_RIGHT_2 = 5   # 第二次右转90度
-    PHASE_FORWARD_2 = 6      # 第二次直走一段
-    PHASE_TURN_AROUND = 7    # 原地转180度
-    PHASE_FORWARD_3 = 8      # 第三次直走一段
-    PHASE_TURN_LEFT_1 = 9    # 第一次左转90度
-    PHASE_FORWARD_4 = 10     # 第四次直走一段（回到起点）
-    PHASE_TURN_LEFT_2 = 11   # 第二次左转90度
-    PHASE_FORWARD_5 = 12     # 第五次直走一段
-    
-    PHASE_TURN_RIGHT_3 = 13   # 最后一次右转
-    PHASE_FORWARD_6 = 14      # 最后直走一点点
-    
-    PHASE_S = 19
-    TEST = 99
-
-    APHASE_GANZI = 100
-    PHASE_ARROW = 101
-    APHASE_FORWARD_1 = 102
-    APHASE_PO_JIAODU = 103
-    APHASE_YELLOW = 104
-
-    APHASE_YELLOW_STOP = 105
-    APHASE_YELLOW_FORWARD = 106
-    APHASE_QR2_TURN_LEFT = 107
-    APHASE_QR2_FORWARD = 108
-    APHASE_QR2_TURN_TO = 109
-    APHASE_QR2_SCAN = 110
-    APHASE_QR2_OVER = 111
-    APHASE_FORWARD_KU = 112
-    APHASE_QR2_TURN_LEFT_2 = 113
-    APHASE_INKU_BACK  = 114
-    APHASE_IKU = 115
-    APHASE_FORWARD_2 = 116
+    PHASE_TURN_LEFT_1 = 9    # 初始阶段
     APHASE_SHIBAN = 117
-    APHASE_TUEN_RIGHT  = 118
-    APHASE_FORWARD_ARROW = 119
-    APHASE_TUEN_LEFT = 120
-    APHASE_S_2 = 121
-    FIX_MID = 998
     FIX_DIR = 999
 
-# you 3.14
-# hou 1.63
-# qian -1.54
-# zuo 0
-    A_D = 205
     current_phase = PHASE_TURN_LEFT_1  # 开始
 
     try:
