@@ -312,9 +312,7 @@ class LaneFollowerPP(Node):
         self.steer = -steer
         self.steer_h  = -s_h
         if self.debug == 1 :
-            cv.imshow("vis",vis)
-            cv.imshow("mash",mask_vis)
-            cv.waitKey(1)
+            pass
 
 
     def process_image(self, cv_image):
@@ -428,9 +426,6 @@ class LaneFollowerPP(Node):
                 
 
 
-        cv.imshow("Debug", vis_debug) # 如果需要显示
-        cv.waitKey(1)
-
         # ===== 2. 行扫描 =====
         for y in range(h):
             row = mask[y]
@@ -449,7 +444,6 @@ class LaneFollowerPP(Node):
                     elif is_yellow:
                         left_edge = x
                         state = 1
-
 
                 elif state == 1:
                     if not is_yellow:
@@ -644,9 +638,6 @@ class LaneFollowerPP(Node):
                 cv.circle(vis_debug, (x, y_bottom), 3, (0, 0, 255), -1) # Red
                 
 
-
-        cv.imshow("Debug", vis_debug) # 如果需要显示
-        cv.waitKey(1)
 
         # ===== 2. 行扫描 =====
         for y in range(h):
