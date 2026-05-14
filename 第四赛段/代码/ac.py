@@ -390,92 +390,6 @@ class StickDetectorNode(DynamicVisionNode):
         self.stick_found = False
         self.has_stick = None
 
-class LaserScanNode(Node):
-    def __init__(self):
-        super().__init__('laser_scan_detector_node')
-        
-        self.ranges = [] 
-        self.min_range = 0.0
-        self.front_ranges = [] # 专门存储前方角度的数据
-        
-        scan_qos = QoSProfile(
-            depth=10,
-            reliability=ReliabilityPolicy.BEST_EFFORT, # 激光雷达数据量大，通常用 BEST_EFFORT
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST
-        )
-
-        # 常见的激光雷达话题名称 (Gazebo 通常是 /scan, 实机可能是 /lidar_points 或 /scan_raw)
-        self.topic_name = '/scan'
-
-        self.subscription = self.create_subscription(
-            LaserScan,
-            self.topic_name,
-            self.scan_callback,
-            scan_qos
-        )
-        
-        self.get_logger().info(f"LaserScan node started, listening to: {self.topic_name}")
-
-    def scan_callback(self, msg: LaserScan):
-        # 1. 原始数据获取
-        # msg.ranges 是一个 float32 的列表，长度通常为 360, 720, 1080 等
-        raw_ranges = list(msg.ranges)
-        
-        # 2. 数据清洗：替换 inf (无穷大) 和 nan 为一个超大值 (例如 100.0 米)，防止计算报错
-        clean_ranges = []
-        for r in raw_ranges:
-            if math.isinf(r) or math.isnan(r):
-                clean_ranges.append(0) # 视为“无限远”
-            else:
-                clean_ranges.append(r)
-        
-        self.ranges = clean_ranges
-        
-        # 3. 提取感兴趣区域 (ROI) - 例如：只取正前方 ±45 度的数据
-        # 计算公式：索引 = (角度 - 最小角度) / 角度增量
-        angle_min = msg.angle_min
-        angle_max = msg.angle_max
-        angle_inc = msg.angle_increment
-        
-        # 假设我们要取 -45度 到 +45度 (即 -0.785 到 0.785 弧度)
-        target_angle_min = -0.785 
-        target_angle_max = 0.785
-        
-        start_idx = int((target_angle_min - angle_min) / angle_inc)
-        end_idx = int((target_angle_max - angle_min) / angle_inc)
-        
-        # 边界保护，防止索引越界
-        # start_idx = max(0, start_idx)
-        # end_idx = min(len(self.ranges), end_idx)
-        start_idx  =  0
-        end_idx = len(self.ranges)
-        if start_idx < end_idx:
-            self.front_ranges = self.ranges[start_idx:end_idx]
-            
-            # 4. 数据分析
-            if len(self.front_ranges) > 0:
-                # --- 计算最小距离 ---
-                self.min_range = max(self.front_ranges)
-                
-                # --- 【新增】计算平均距离 ---
-                # sum() 求和，len() 求个数
-                self.avg_range = sum(self.front_ranges) / len(self.front_ranges)
-                
-                # 打印日志验证
-                # self.get_logger().info(
-                #     f"Front Stats -> Min: {self.min_range:.2f} m, Avg: {self.avg_range:.2f} m, Count: {len(self.front_ranges)}"
-                # )
-            else:
-                # 理论上不会进这里，因为上面判断了 len > 0
-                self.min_range = 100.0
-                self.avg_range = 100.0
-                
-        else:
-            self.min_range = 100.0
-            self.avg_range = 100.0
-            self.front_ranges = []
-
 class LaneFollowerPP(Node):
     def __init__(self):
 
@@ -1240,13 +1154,11 @@ def main(args=None):
 
     nodeS = StickDetectorNode()
     nodeI = ImuTestNode()
-    nodeL = LaserScanNode()
     nodeLine = LaneFollowerPP()
 
     executor = SingleThreadedExecutor()
     executor.add_node(nodeI)
     executor.add_node(nodeS)
-    # executor.add_node(nodeL)
     executor.add_node(nodeLine)
 
 
