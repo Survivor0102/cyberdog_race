@@ -133,6 +133,66 @@ def get_pitch_from_quaternion(x, y, z, w):
     return pitch
 
 
+class FisheyeUndistortNode(Node):
+    def __init__(self):
+        super().__init__('fisheye_undistort_debug')
+
+        qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+
+        self.bridge = CvBridge()
+
+        fx = 640 / 2.55
+        fy = 640 / 2.55
+        cx = 320.0
+        cy = 240.0
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+        D = np.zeros((4, 1), dtype=np.float32)
+
+        new_K = cv.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D, (640, 480), np.eye(3), balance=0.5
+        )
+        self.map1, self.map2 = cv.fisheye.initUndistortRectifyMap(
+            K, D, np.eye(3), new_K, (640, 480), cv.CV_16SC2
+        )
+
+        self.sub_left = self.create_subscription(
+            Image, '/fisheye_left_camera/image_raw', self.left_cb, qos
+        )
+        self.sub_right = self.create_subscription(
+            Image, '/fisheye_right_camera/image_raw', self.right_cb, qos
+        )
+
+        self.last_left = None
+        self.last_right = None
+        self.timer = self.create_timer(0.05, self.show)
+
+        self.get_logger().info('Fisheye undistort node started')
+
+    def left_cb(self, msg):
+        self.last_left = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+
+    def right_cb(self, msg):
+        self.last_right = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+
+    def show(self):
+        if self.last_left is not None:
+            left = self.last_left
+            left_ud = cv.remap(left, self.map1, self.map2, cv.INTER_LINEAR)
+            cv.imshow('Left (undistorted)', left_ud)
+
+        if self.last_right is not None:
+            right = self.last_right
+            right_ud = cv.remap(right, self.map1, self.map2, cv.INTER_LINEAR)
+            cv.imshow('Right (undistorted)', right_ud)
+
+        cv.waitKey(1)
+
+
 class ImuTestNode(Node):
     def __init__(self):
         super().__init__('qx_detector_node')
@@ -700,10 +760,12 @@ def main(args=None):
 
     nodeI = ImuTestNode()
     nodeLine = LaneFollowerPP()
+    nodeFish = FisheyeUndistortNode()
 
     executor = SingleThreadedExecutor()
     executor.add_node(nodeI)
     executor.add_node(nodeLine)
+    executor.add_node(nodeFish)
 
 
     PHASE_TURN_LEFT_1 = 9    # 初始阶段
@@ -825,6 +887,8 @@ def main(args=None):
         finally:
             executor.shutdown()
             nodeI.destroy_node()
+            nodeFish.destroy_node()
+            cv.destroyAllWindows()
         
         
         msg.mode = 7    # PureDamper
