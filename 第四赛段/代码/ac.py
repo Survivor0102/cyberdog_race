@@ -86,49 +86,6 @@ class Robot_Ctrl(object):
         self.rec_thread.join()
         self.send_thread.join()
 
-def draw_numbered_lines(img, lines, line_color=(0, 255, 0), point_color=(0, 0, 255), text_color=(255, 255, 0)):
-    """
-    在图像上绘制所有直线，加粗起点终点，并在线段中间标注编号。
-    
-    参数:
-    img: 输入图像 (会被直接修改)
-    lines: HoughLinesP 输出的线条数据
-    line_color: 直线颜色 (B, G, R)，默认绿色
-    point_color: 端点颜色 (B, G, R)，默认红色
-    text_color: 编号文字颜色 (B, G, R)，默认青色
-    """
-    if lines is None:
-        return img
-
-    debug_img = img.copy() # 建议复制一份，以免破坏原图用于后续处理
-    # 如果确定不需要保留原图，也可以直接用 img
-    
-    for idx, l in enumerate(lines):
-        x1, y1, x2, y2 = l[0]
-        
-        # 1. 绘制直线 (粗细为 2)
-        cv.line(debug_img, (x1, y1), (x2, y2), line_color, 2)
-        
-        # 2. 加粗绘制起点和终点 (画实心圆，半径 4)
-        cv.circle(debug_img, (x1, y1), 4, point_color, -1)
-        cv.circle(debug_img, (x2, y2), 4, point_color, -1)
-        
-        # 3. 计算线段中点，用于放置编号
-        mid_x = int((x1 + x2) / 2)
-        mid_y = int((y1 + y2) / 2)
-        
-        # 4. 绘制编号背景 (可选：加一个小黑底让文字更清晰)
-        # font = cv.FONT_HERSHEY_SIMPLEX
-        # text_size = cv.getTextSize(str(idx), font, 0.5, 1)[0]
-        # cv.rectangle(debug_img, (mid_x - text_size[0]//2, mid_y - text_size[1] - 2), 
-        #              (mid_x + text_size[0]//2, mid_y + 2), (0, 0, 0), -1)
-        
-        # 5. 绘制编号文字
-        # 参数：图像，文字，位置，字体，缩放比例，颜色，粗细
-        cv.putText(debug_img, str(idx), (mid_x, mid_y), 
-                   cv.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
-
-    return debug_img
 
 def get_yaw_from_quaternion(x, y, z, w):
     """
@@ -223,136 +180,6 @@ class ImuTestNode(Node):
         pitch_deg = math.degrees(pitch_rad)
         self.current_pitch = pitch_deg
         
-
-class VisionUtils:
-    def __init__(self, node_logger):
-        self.bridge = CvBridge()
-        self.logger = node_logger
-        self.has_display = os.environ.get('DISPLAY') is not None
-
-    def msg_to_cv(self, msg, encoding='bgr8'):
-        try:
-            return self.bridge.imgmsg_to_cv2(msg, desired_encoding=encoding)
-        except Exception as e:
-            self.logger.error(f"CvBridge error: {e}")
-            return None
-
-
-class DynamicVisionNode(Node):
-    def __init__(self, node_name, topic_name, callback_func):
-        super().__init__(node_name)
-        self.vision = VisionUtils(self.get_logger())
-        self.topic_name = topic_name
-        self.callback_func = callback_func
-        
-        # 状态管理
-        self.is_active = False
-        self.subscription = None
-        
-        # QoS 配置
-        self.qos = QoSProfile(
-            depth=5,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST
-        )
-        
-        self.get_logger().info(f"{node_name} 初始化完成 (当前状态：未激活)")
-
-    def enable(self):
-        """启动订阅，开始检测"""
-        if not self.is_active:
-            self.subscription = self.create_subscription(
-                Image, self.topic_name, self._internal_callback, self.qos
-            )
-            self.is_active = True
-            self.get_logger().info(f">>> [{self.get_name()}] 已激活，开始接收图像")
-
-    def _internal_callback(self, msg):
-        """内部回调：先检查业务逻辑是否需要处理，再调用具体算法"""
-        if not self.is_active:
-            return
-        
-        # 调用子类或传入的具体处理函数
-        self.callback_func(msg, self.vision,self)
-
-
-def process_stick_logic(msg, vision_utils, node_instance):
-    """
-    杆子检测具体逻辑
-    :param msg: ROS Image 消息
-    :param vision_utils: 视觉工具类实例
-    :param node_instance: StickDetectorNode 实例 (用于更新 self.has_stick)
-    """
-    # 1. 图像转换
-    img = vision_utils.msg_to_cv(msg)
-    if img is None: 
-        if node_instance: node_instance.has_stick = None
-        return
-
-    # 2. 预处理 (严格按照你提供的格式)
-    gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-    blur = cv.GaussianBlur(gray, (5, 5), 0)
-    edges = cv.Canny(blur, 20, 80, apertureSize=3)
-
-    # 3. 霍夫变换 (严格按照你提供的格式)
-    lines = cv.HoughLinesP(edges,
-                        rho=1,
-                        theta=np.pi / 180,
-                        threshold=20,
-                        minLineLength=10,
-                        maxLineGap=50)
-    
-    # 4. 调试可视化 (使用已实现的 draw_numbered_lines)
-    # 注意：如果 lines 为 None，draw_numbered_lines 需要能处理，或者这里加个判断
-    if lines is not None:
-        test_img = draw_numbered_lines(img.copy(), lines)
-        cv.imshow("line_img", test_img) 
-    else:
-        cv.imshow("line_img", img)
-    
-    cv.waitKey(1)
-
-    # 5. 核心逻辑：寻找垂直杆子
-    has_stick = None  # 初始化局部变量
-    # h, w = img.shape[:2] # 原代码中有这行，如果后续没用可以注释掉，这里保留以防万一
-    
-    if lines is not None:
-        for l in lines:
-            x1, y1, x2, y2 = l[0]
-            dx = abs(x2 - x1)
-            dy = abs(y2 - y1)
-            
-            # 筛选条件：垂直 (dy大, dx小)
-            if dy > 50 and dx < 5:
-                print("findxxxxxxxxxxxxxx")
-                has_stick = ((x1, y1), (x2, y2))
-                break # 找到一根典型的即可退出循环
-
-    # 6. 【关键步骤】将结果回写到节点实例
-    if node_instance:
-        node_instance.has_stick = has_stick
-    
-    # 7. 最终可视化 (严格按照你提供的格式，修正了 self 引用错误)
-    if has_stick is not None:
-        color = (0, 0, 255) 
-        thickness = 2    
-        # 修正：原代码写的是 self.has_stick[0]，但在独立函数中应使用局部变量 has_stick
-        cv.line(img, has_stick[0], has_stick[1], color, thickness)
-        
-        # 建议使用 vision_utils.show 以兼容无显示器环境，若必须用 cv.imshow 也可
-        cv.imshow("stick_find", img)
-        cv.waitKey(1)
-    else:
-        # 可选：如果没有找到，是否要关闭窗口或显示原图？
-        pass
-    
-
-class StickDetectorNode(DynamicVisionNode):
-    def __init__(self):
-        super().__init__('stick_detector', '/rgb_camera/image_raw', process_stick_logic)
-        self.stick_found = False
-        self.has_stick = None
 
 class LaneFollowerPP(Node):
     def __init__(self):
@@ -871,13 +698,11 @@ def main(args=None):
     msg = robot_control_cmd_lcmt()
 
 
-    nodeS = StickDetectorNode()
     nodeI = ImuTestNode()
     nodeLine = LaneFollowerPP()
 
     executor = SingleThreadedExecutor()
     executor.add_node(nodeI)
-    executor.add_node(nodeS)
     executor.add_node(nodeLine)
 
 
@@ -901,7 +726,6 @@ def main(args=None):
         MAX_VEL = 0.32           # 最大角速度：限制远距离时的最高转速 (原固定值为 0.1)
         MIN_VEL_THRESHOLD = 0.6 # 死区阈值：当误差小于此值时，认为已对准
         STOP_VEL = 0.0          # 停止时的速度
-        nodeS.enable()
 
         try:
             while rclpy.ok():
@@ -1001,7 +825,6 @@ def main(args=None):
         finally:
             executor.shutdown()
             nodeI.destroy_node()
-            nodeS.destroy_node()
         
         
         msg.mode = 7    # PureDamper
